@@ -1,0 +1,221 @@
+---
+  title: "Power before normalization"
+author: "Sifan, Ziyi"
+date: "2024-10-05"
+output: csv_document
+---
+  
+```{r}
+# Install necessary packages
+if (!require(geepack)) install.packages('geepack')
+if (!require(MASS)) install.packages('MASS')
+if (!require(lme4)) install.packages('lme4')
+if (!require(lmerTest)) install.packages('lmerTest')
+if (!require(geem2)) install.packages('geem2')
+if(!"lmtest" %in% rownames(installed.packages())) {
+  install.packages("lmtest")
+}
+if (!require(geepack)) install.packages('mmmgee')
+#if(!require(geem)) install.packages('geem')
+if(!require(mmmgee)) install.packages('mmmgee')
+if(!require(reshape2)) install.packages("reshape2")
+if(!require(data.table)) install.packages("data.table")
+if(!require(dplyr)) install.packages("dplyr")
+if(!require(mnonr)) install.packages('mnonr')
+
+
+
+# Load necessary packages
+library(geepack)
+library(MASS)
+library(lme4)
+library(lmerTest)
+library(lmtest)
+library(mmmgee)
+library(reshape2)
+library(data.table)
+library(dplyr)
+library(nlme)
+library(mnonr)
+#library(geem)
+install.packages("clusrank")
+library(clusrank)
+# Set options to suppress singularity warnings
+options(lme4Control=list(checkConv = list(action = "warning", singular.ok = TRUE)))
+```
+
+
+```{r}
+set.seed(0012)
+# Simulation settings
+sample_sizes <- c(20, 50, 100, 200)
+correlations <- c(0, 0.25, 0.5, 0.75)
+mean_diffs <- c(0.2) #For power, we define the mean_diff to be 0.2
+
+
+# repetitions for each simulation setting
+n_reps <- 5000
+
+# Define combinations of ms and mk values
+#ms_mk_combos <- list(c(27, 50))
+ms_mk_combos <- list(c(0.06, 5.9))
+
+
+# Initialize a data frame to store power
+power_df <- data.frame(
+  'rho' = double(),
+  'No. of subjects' = integer(),
+  'mean_diff' = double(),
+  'Random pick one of the two eyes' = double(),
+  'Average of two eyes' = double(),
+  'GEE Wald test independent' = double(),
+  'GEE Score test independent' = double() ,
+  'LMM' = double(),
+  'Cluster Wilcox - RGL' = double(),
+  'Cluster Wilcox - DS' = double(),
+  'Rank Sum Test' = double()
+)
+
+
+# Outer loop for ms, mk combinations
+for (combo in ms_mk_combos) {
+  ms <- combo[1]
+  mk <- combo[2]
+  
+  # loop through combinations of correlation, sample size, and mean_diff
+  for (corr in correlations) {
+    for (sample_size in sample_sizes) {
+      for (mean_diff in mean_diffs) {
+        
+        # Print the current simulation settings
+        print(paste0("Running simulation for correlation = ", corr,
+                     ", sample size = ", sample_size,
+                     ", mean difference = ", mean_diff,
+                     ", ms = ", ms, ", mk = ", mk))
+        Sigma <- matrix(c(1, corr, corr, 1), ncol = 2)  # Specify the covariance matrix
+        
+        # Initialize vectors to store p-values
+        p_values_ignore_correlation <- numeric(n_reps)
+        p_values_random_pick <- numeric(n_reps)
+        p_values_average_eyes <- numeric(n_reps)
+        p_values_gee_wald_independent <- numeric(n_reps)
+        p_values_gee_score_independent <- numeric(n_reps)
+        p_values_lmm <- numeric(n_reps)
+        p_values_clusWilcox_rgl <- numeric(n_reps)
+        p_values_clusWilcox_ds <- numeric(n_reps)
+        p_values_rank_sum <- numeric(n_reps)
+        
+        
+        
+        for (i in 1:n_reps) {
+          data_treatment <- mnonr(sample_size/2, 2, ms, mk, Sigma = Sigma)
+          data_control <- mnonr(sample_size/2, 2, ms, mk, Sigma = Sigma)
+          
+          data_treatment[,1] <- data_treatment[,1] + mean_diff
+          data_treatment[,2] <- data_treatment[,2] + mean_diff
+          data <- rbind(data_treatment, data_control)
+          
+          #mean(data_treatment)-mean(data_control)
+          # Reshape data for GEE and LMM
+          df_treatment <- data.frame(
+            Subject = rep(1:(sample_size/2), each = 2),
+            Eye = rep(c("Left", "Right"), sample_size/2),
+            Group = rep("Treatment", sample_size),
+            Measurement = as.vector(t(data_treatment))
+          )
+          
+          df_control <- data.frame(
+            Subject = rep((sample_size/2 + 1):sample_size, each = 2),
+            Eye = rep(c("Left", "Right"), sample_size/2),
+            Group = rep("Control", sample_size),
+            Measurement = as.vector(t(data_control))
+          )
+          
+          df <- rbind(df_treatment, df_control)
+          
+
+          # Randomly pick one eye (from each group)
+          df_random <- df %>%
+            group_by(Group, Subject) %>%
+            sample_n(size = 1)
+          random_t_test_result <- t.test(df_random$Measurement[df_random$Group == "Treatment"],
+                                         df_random$Measurement[df_random$Group == "Control"])
+          p_values_random_pick[i] <- random_t_test_result$p.value
+          
+          
+          # average of two eyes
+          df_avg <- df %>%
+            group_by(Group, Subject) %>%
+            summarise(Measurement = mean(Measurement), .groups='drop')
+          average_t_test_result <- t.test(df_avg$Measurement[df_avg$Group == "Treatment"],
+                                          df_avg$Measurement[df_avg$Group == "Control"])
+          p_values_average_eyes[i] <- average_t_test_result$p.value
+          
+          
+          # GEE Wald test with independent correlation structure
+          gee_model_independent <- geeglm(Measurement ~ Group, id = Subject, data = df, corstr = "independence")
+          p_values_gee_wald_independent[i] <- summary(gee_model_independent)$coefficients[2, 4]
+          
+          
+          # GEE Score test independent
+          gee_mod <- geem2(Measurement ~ Group, id = Subject, data = df, corstr = "independence")
+          L <- matrix(c(0, 1), nrow = 1) # 1 row for 1 contrast, 2 cols for 2 coefficients
+          test <- mmmgee.test(gee_mod, L = L, statistic = "score")
+          tmp_p <- test$test$global$p
+          p_values_gee_score_independent[i] <- tmp_p
+          
+        
+          # Fit LMM
+          lmm_model <- suppressWarnings(lmer(Measurement ~ Group + (1|Subject), data = df))
+          p_values_lmm[i] <- summary(lmm_model)$coefficients[2, "Pr(>|t|)"]
+          
+          
+          # Cluster Wilcox - RGL
+          clusWilcox_model_rgl <- suppressWarnings(clusWilcox.test(Measurement ~ Group + cluster(Subject), data = df, method = "rgl"))
+          p_values_clusWilcox_rgl[i] <- clusWilcox_model_rgl$p.value
+          
+          # Cluster Wilcox - DS
+          clusWilcox_model_ds <- suppressWarnings(clusWilcox.test(Measurement ~ Group + cluster(Subject), data = df, method = "ds"))
+          p_values_clusWilcox_ds[i] <- clusWilcox_model_ds$p.value
+          
+          # Rank Sum Test (Wilcoxon Rank Sum Test) on the average of two eyes
+          rank_sum_test_result <- wilcox.test(df_avg$Measurement[df_avg$Group == "Treatment"], df_avg$Measurement[df_avg$Group == "Control"],paired=FALSE)
+          p_values_rank_sum[i] <- rank_sum_test_result$p.value
+          
+        }
+        
+        
+        
+        
+        # Calculate power and store in power_df
+        power_df <- rbind(power_df, data.frame(
+          'rho' = corr,
+          'No. of subjects' = sample_size,
+          'mean_diff' = mean_diff,
+          'Random pick one of the two eyes' = mean(p_values_random_pick < 0.05),
+          'Average of two eyes' = mean(p_values_average_eyes < 0.05),
+          'GEE Wald test independent' = mean(p_values_gee_wald_independent < 0.05),
+          'GEE Score test independent' = mean(p_values_gee_score_independent < 0.05),
+          'LMM' = mean(p_values_lmm < 0.05),
+          'Cluster Wilcox - RGL' = mean(p_values_clusWilcox_rgl < 0.05),
+          'Cluster Wilcox - DS' = mean(p_values_clusWilcox_ds < 0.05),
+          'Rank Sum Test' = mean(p_values_rank_sum < 0.05)
+        ))
+        
+        
+      }
+    }
+  }
+  
+  
+}
+
+
+# rounding off the numeric values in the dataframe to 4 decimal places
+power_df[, sapply(power_df, is.numeric)] <- round(power_df[,sapply(power_df, is.numeric)], 4)
+
+# print power and bias data frames
+print(power_df)
+write.csv(power_df, "0.06powerbefore.csv", row.names = F)
+
+```

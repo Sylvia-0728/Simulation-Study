@@ -1,0 +1,225 @@
+---
+title: "Type 1 error before normalization"
+author: "Sifan, Ziyi"
+date: "2024-08-10"
+output: csv_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Install necessary packages
+if (!require(geepack)) install.packages('geepack')
+if (!require(MASS)) install.packages('MASS')
+if (!require(lme4)) install.packages('lme4')
+if (!require(lmerTest)) install.packages('lmerTest')
+if (!require(geem2)) install.packages('geem2')
+if(!"lmtest" %in% rownames(installed.packages())) {
+  install.packages("lmtest")
+}
+if (!require(geepack)) install.packages('mmmgee')
+#if(!require(geem)) install.packages('geem')
+if(!require(mmmgee)) install.packages('mmmgee')
+if(!require(reshape2)) install.packages("reshape2")
+if(!require(data.table)) install.packages("data.table")
+if(!require(dplyr)) install.packages("dplyr")
+if(!require(mnonr)) install.packages('mnonr')
+
+
+        
+# Load necessary packages
+library(geepack)
+library(MASS)
+library(lme4)
+library(lmerTest)
+library(lmtest)
+library(mmmgee)
+library(reshape2)
+library(data.table)
+library(dplyr)
+library(nlme)
+library(mnonr)
+#library(geem)
+install.packages("clusrank")
+library(clusrank)
+# Set options to suppress singularity warnings
+options(lme4Control=list(checkConv = list(action = "warning", singular.ok = TRUE)))
+set.seed(123) 
+```
+
+
+```{r}
+# Simulation settings
+sample_sizes <- c(20, 50 ,100, 200)
+correlations <- c(0, 0.25, 0.5, 0.75)
+mean_diffs <- c(0) # For type 1 error, we define the mean_diff to be 0
+
+# repetitions for each simulation setting
+n_reps <- 5000
+
+# Define combinations of ms and mk values
+#ms_mk_combos <- list(c(27, 50))
+ms_mk_combos <- list(c(0.06, 5.9))
+
+# Initialize a data frame to store type I error rates
+type_I_errors_df <- data.frame('rho' = double(),
+                                'No. of subjects' = integer(),
+                                'Ignore correlation of two eyes' = double(),
+                                'Random pick one of the two eyes' = double(),
+                                'Average of two eyes' = double(),
+                                'GEE Wald test independence' = double(),
+                                'GEE Score test independence' = double(),
+                                'LMM' = double(),
+                                'Cluster Wilcox - RGL' = double(),
+                                'Cluster Wilcox - DS' = double(),
+                                'Wilcoxon Rank-Sum' = double(),
+                                'Wilcoxon Rank-Sum-Individual' = double()
+                               )
+
+# Outer loop for ms, mk combinations
+for (combo in ms_mk_combos) {
+  ms <- combo[1]
+  mk <- combo[2]
+
+  # loop through combinations of correlation, sample size, and mean_diff
+  for (corr in correlations) {
+    for (sample_size in sample_sizes) {
+      for (mean_diff in mean_diffs) {
+
+        # Print the current simulation settings
+        print(paste0("Running simulation for correlation = ", corr,
+                     ", sample size = ", sample_size,
+                     ", mean difference = ", mean_diff,
+                     ", ms = ", ms, ", mk = ", mk))
+        Sigma <- matrix(c(1, corr, corr, 1), ncol = 2)  # Specify the covariance matrix
+
+        # Initialize vectors to store p-values
+        p_values_ignore_correlation <- numeric(n_reps)
+        p_values_random_pick <- numeric(n_reps)
+        p_values_average_eyes <- numeric(n_reps)
+        p_values_gee_wald_independence <- numeric(n_reps)
+        p_values_gee_score_independence <- numeric(n_reps)
+        p_values_lmm <- numeric(n_reps)
+        p_values_clusWilcox_rgl <- numeric(n_reps)
+        p_values_clusWilcox_ds <- numeric(n_reps)
+        p_values_rank_sum <- numeric(n_reps)
+        p_values_rank_sum_individual <- numeric(n_reps)
+
+        for (i in 1:n_reps) {
+          # Print the current repetition number
+          data_treatment <- mnonr(sample_size/2, 2, ms, mk, Sigma = Sigma)
+          data_control <- mnonr(sample_size/2, 2, ms, mk, Sigma = Sigma)
+          
+          data_treatment[,1] <- data_treatment[,1] + mean_diff
+          data_treatment[,2] <- data_treatment[,2] + mean_diff
+          data <- rbind(data_treatment, data_control)
+          
+          # Reshape data for GEE and LMM
+          df_treatment <- data.frame(
+            Subject = rep(1:(sample_size/2), each = 2),
+            Eye = rep(c("Left", "Right"), sample_size/2),
+            Group = rep("Treatment", sample_size),
+            Measurement = as.vector(t(data_treatment))
+          )
+          
+          df_control <- data.frame(
+            Subject = rep((sample_size/2 + 1):sample_size, each = 2),
+            Eye = rep(c("Left", "Right"), sample_size/2),
+            Group = rep("Control", sample_size),
+            Measurement = as.vector(t(data_control))
+          )
+          
+          df <- rbind(df_treatment, df_control)
+          
+          
+            # Use both eyes' data separately (ignore correlation)
+            t_test_result <- t.test(df$Measurement[df$Group == "Treatment"],
+                                    df$Measurement[df$Group == "Control"])
+            p_values_ignore_correlation[i] <- t_test_result$p.value
+
+            # Randomly pick one eye (from each group)
+            df_random <- df %>%
+              group_by(Group, Subject) %>%
+              sample_n(size = 1)
+            p_values_random_pick[i] <- t.test(df_random$Measurement[df_random$Group == "Treatment"],
+                                              df_random$Measurement[df_random$Group == "Control"])$p.value
+            
+            # average of two eyes
+            df_avg <- df %>%
+            group_by(Group, Subject) %>%
+            summarise(Measurement = mean(Measurement), .groups='drop')
+            p_values_average_eyes[i] <- t.test(df_avg$Measurement[df_avg$Group == "Treatment"],
+                                               df_avg$Measurement[df_avg$Group == "Control"])$p.value
+
+            
+          # GEE Wald test independence
+            gee_model_independence <- geeglm(Measurement ~ Group, id = Subject, data = df, corstr="independence")
+
+           p_values_gee_wald_independence[i] <- summary(gee_model_independence)$coefficients[2, 4]
+        
+          # GEE Score test independence
+           gee_mod_independence <- geem2(Measurement ~ Group, id = Subject, data = df, corstr="independence")
+           L <- matrix(c(0, 1), nrow = 1) 
+          test <- mmmgee.test(gee_mod_independence, L = L, statistic = "score")
+          tmp_p <- test$test$global$p
+           p_values_gee_score_independence[i] <- tmp_p
+        
+            # Fit LMM
+            lmm_model <- suppressWarnings(lmer(Measurement ~ Group + (1|Subject), data = df))
+            p_values_lmm[i] <- summary(lmm_model)$coefficients[2, "Pr(>|t|)"]
+
+            # Cluster Wilcox - RGL
+            clusWilcox_model_rgl <- suppressWarnings(clusWilcox.test(Measurement ~ Group + cluster(Subject), data = df, method = "rgl"))
+            p_values_clusWilcox_rgl[i] <- clusWilcox_model_rgl$p.value
+            
+            # Cluster Wilcox - DS
+            clusWilcox_model_ds <- suppressWarnings(clusWilcox.test(Measurement ~ Group + cluster(Subject), data = df, method = "ds"))
+            p_values_clusWilcox_ds[i] <- clusWilcox_model_ds$p.value
+
+            # Wilcoxon Rank-Sum Test for independent samples, using the average of two eyes.
+            p_values_rank_sum[i] <- wilcox.test(df_avg$Measurement[df_avg$Group == "Treatment"],
+                                    df_avg$Measurement[df_avg$Group == "Control"],paired=FALSE)$p.value
+
+            # Wilcoxon Rank-Sum Test for independent samples, using individual eye data
+            p_values_rank_sum_individual[i] <- wilcox.test(df$Measurement[df$Group == "Treatment"],
+                                                df$Measurement[df$Group == "Control"])$p.value
+        }
+
+            # calculate type I error rates and append to data frame
+      type_I_errors_df <- rbind(type_I_errors_df, data.frame(
+        'rho' = corr,
+        'No. of subjects' = sample_size,
+        'Ignore correlation of two eyes' = mean(p_values_ignore_correlation < 0.05),
+        'Random pick one of the two eyes' = mean(p_values_random_pick < 0.05),
+        'Average of two eyes' = mean(p_values_average_eyes < 0.05),
+        'GEE Wald test independence' = mean(p_values_gee_wald_independence < 0.05),
+       'GEE Score test independence' = mean(p_values_gee_score_independence < 0.05),
+        'LMM' = mean(p_values_lmm < 0.05),
+        'Cluster Wilcox - RGL' = mean(p_values_clusWilcox_rgl < 0.05),
+        'Cluster Wilcox - DS' = mean(p_values_clusWilcox_ds < 0.05),
+        'Wilcoxon Rank-Sum' = mean(p_values_rank_sum < 0.05),
+        'Wilcoxon Rank-Sum-Individual' = mean(p_values_rank_sum_individual < 0.05)
+          ))
+        }
+      }
+  }
+
+                
+  }
+
+
+# rounding off the numeric values in the dataframe to 4 decimal places
+type_I_errors_df[, sapply(type_I_errors_df, is.numeric)] <- 
+round(type_I_errors_df[, sapply(type_I_errors_df, is.numeric)], 4)
+
+
+# print data frame
+print(type_I_errors_df)
+write.csv(type_I_errors_df, "0.06type1before.csv", row.names = F)
+
+```
+
+
+
